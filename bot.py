@@ -15,22 +15,24 @@ dp = Dispatcher()
 
 os.makedirs("temp", exist_ok=True)
 user_fps = {}
-ALLOWED_FPS = [15, 24, 30, 60]
+
+# Только разрешенные Telegram значения FPS для видеостикеров
+ALLOWED_FPS = [15, 24, 30]
 
 def get_fps_keyboard(current_fps: int) -> ReplyKeyboardMarkup:
-    row = []
-    for fps in ALLOWED_FPS:
-        label = f"✅ {fps} FPS" if fps == current_fps else f"{fps} FPS"
-        row.append(KeyboardButton(text=label))
+    row = [
+        KeyboardButton(text=f"✅ {fps} FPS" if fps == current_fps else f"{fps} FPS")
+        for fps in ALLOWED_FPS
+    ]
     return ReplyKeyboardMarkup(keyboard=[row], resize_keyboard=True)
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     fps = user_fps.get(message.from_user.id, 30)
     await message.answer(
-        f"👋 Привет! Я конвертирую видео, GIF и фото в **WebM (VP9, 16:9, 512×288, без звука)**.\n\n"
-        f"🎬 Текущая частота кадров: **{fps} FPS**\n"
-        f"Выбери FPS кнопками ниже и отправь файл (обрезать длину и кадр можно прямо в Telegram перед отправкой).",
+        f"🎬 Конвертер в **WebM (VP9, 16:9, 512×288, без звука, <256 КБ)**.\n"
+        f"Текущий FPS: **{fps}**\n\n"
+        f"Отправь видео, GIF или фото (обрезать длину и кадр можно прямо в Telegram перед отправкой).",
         reply_markup=get_fps_keyboard(fps),
         parse_mode="Markdown"
     )
@@ -42,7 +44,7 @@ async def set_fps(message: Message):
         if fps_val in ALLOWED_FPS:
             user_fps[message.from_user.id] = fps_val
             await message.answer(
-                f"⚙️ Установлено: **{fps_val} FPS**",
+                f"⚙️ Выбрано: **{fps_val} FPS**",
                 reply_markup=get_fps_keyboard(fps_val),
                 parse_mode="Markdown"
             )
@@ -50,7 +52,7 @@ async def set_fps(message: Message):
         pass
 
 def convert_to_webm(input_path: str, output_path: str, fps: int, is_image: bool = False):
-    # Сразу уменьшаем кадр до 512x288 с кропом 16:9 на этапе декодирования, чтобы не держать в памяти HD-кадры
+    # Кроп по центру в 16:9 + быстрое сжатие до 512x288 без лишней нагрузки на ОЗУ
     vf_filter = f"crop=iw:iw*9/16:(iw-ow)/2:(ih-oh)/2,scale=512:288:flags=fast_bilinear,fps={fps}"
     
     cmd = [FFMPEG_PATH, "-y", "-threads", "1"]
@@ -63,14 +65,14 @@ def convert_to_webm(input_path: str, output_path: str, fps: int, is_image: bool 
         "-vf", vf_filter,
         "-c:v", "libvpx-vp9",
         "-deadline", "realtime",
-        "-cpu-used", "8",          # Максимальная скорость и минимальный расход ОЗУ
-        "-lag-in-frames", "0",     # Отключаем буфер будущих кадров (экономит до 100 МБ ОЗУ)
-        "-auto-alt-ref", "0",      # Отключаем альтернативные опорные кадры (экономит ОЗУ)
+        "-cpu-used", "8",
+        "-lag-in-frames", "0",
+        "-auto-alt-ref", "0",
         "-threads", "1",
-        "-b:v", "420k",
-        "-maxrate", "480k",
-        "-bufsize", "480k",
-        "-pix_fmt", "yuv420p",     # Без альфа-канала для экономии 25% памяти
+        "-b:v", "380k",
+        "-maxrate", "420k",
+        "-bufsize", "420k",
+        "-pix_fmt", "yuv420p",
         "-an",
         output_path
     ]
@@ -80,7 +82,6 @@ def convert_to_webm(input_path: str, output_path: str, fps: int, is_image: bool 
 async def handle_media(message: Message):
     fps = user_fps.get(message.from_user.id, 30)
     
-    # Проверка размера входящего файла (не больше 15 МБ для 256 МБ ОЗУ)
     file_size = 0
     is_image = False
     if message.video:
@@ -104,18 +105,19 @@ async def handle_media(message: Message):
     else:
         return
 
-    if file_size > 15 * 1024 * 1024:
-        await message.answer("⚠️ Файл слишком тяжелый (>15 МБ). Обрежьте его в редакторе Telegram перед отправкой.")
+    # Ограничение в 10 МБ для защиты контейнера на 256 МБ ОЗУ
+    if file_size > 10 * 1024 * 1024:
+        await message.answer("⚠️ Файл больше 10 МБ. Обрежьте его ножницами в Telegram перед отправкой.")
         return
 
-    msg = await message.answer(f"⏳ Конвертирую в WebM (16:9, {fps} FPS)...")
+    msg = await message.answer(f"⏳ Сжимаю в WebM ({fps} FPS)...")
     
     file = await bot.get_file(file_id)
     in_path = f"temp/{file_id}_in"
     out_path = f"temp/{file_id}.webm"
     
     await bot.download_file(file.file_path, in_path)
-    gc.collect() # Очищаем память перед запуском FFmpeg
+    gc.collect()
     
     try:
         await asyncio.to_thread(convert_to_webm, in_path, out_path, fps, is_image)
@@ -124,7 +126,7 @@ async def handle_media(message: Message):
         doc = FSInputFile(out_path, filename="sticker_16x9.webm")
         await message.answer_document(
             doc, 
-            caption=f"✅ Готово!\n📐 512×288 (16:9) | 🎞 {fps} FPS | 📦 {size_kb:.1f} КБ"
+            caption=f"✅ 512×288 | {fps} FPS | {size_kb:.1f} КБ"
         )
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
@@ -135,7 +137,6 @@ async def handle_media(message: Message):
         gc.collect()
 
 async def main():
-    print("Бот запущен в режиме экономии памяти!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
